@@ -1,0 +1,744 @@
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
+
+# ==============================================================================
+# AUDITORIA DE REDE CFTV PROFISSIONAL v2.0
+# Autor  : Especialista em Segurança de Redes e Infraestrutura de CFTV
+# Uso    : Descoberta, varredura e classificação de dispositivos CFTV
+# Compat : Windows 10/11 | PowerShell 5.1+
+# Avisos : Execute apenas em redes sob sua responsabilidade.
+# ==============================================================================
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIÃO: CONFIGURAÇÃO GLOBAL
+# ─────────────────────────────────────────────────────────────────────────────
+$Script:Config = @{
+    # Portas alvo: HTTP/HTTPS, RTSP, Admin, fabricantes (Dahua, Hikvision, Axis…)
+    Portas         = "21,22,23,80,443,554,5000,8000,8080,8443,37777,37778,34567"
+    NmapTimeout    = 120          # segundos — timeout global do Nmap
+    NmapHostTimeout= "10s"        # timeout por host
+    NmapMinRate    = 100          # pacotes/s mínimo (seguro para redes corp.)
+    NmapMaxRate    = 300          # pacotes/s máximo
+    LogLevel       = "INFO"       # DEBUG | INFO | WARN | ERROR
+    DesktopPath    = [Environment]::GetFolderPath("Desktop")
+    Timestamp      = (Get-Date -Format "yyyy-MM-dd_HH-mm-ss")
+}
+
+$Script:Relatorio   = [System.Collections.Generic.List[PSCustomObject]]::new()
+$Script:LogBuffer   = [System.Collections.Generic.List[string]]::new()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIÃO: FUNÇÕES DE LOG
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Registra mensagens no console com cor e nível de severidade.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Mensagem,
+        [ValidateSet("INFO","WARN","ERROR","SUCCESS","DEBUG","STEP")]
+        [string]$Nivel = "INFO"
+    )
+
+    $cores = @{
+        INFO    = "Cyan"
+        WARN    = "Yellow"
+        ERROR   = "Red"
+        SUCCESS = "Green"
+        DEBUG   = "Gray"
+        STEP    = "Magenta"
+    }
+
+    $prefixos = @{
+        INFO    = "[INFO ]"
+        WARN    = "[AVISO]"
+        ERROR   = "[ERRO ]"
+        SUCCESS = "[  OK ]"
+        DEBUG   = "[DEBUG]"
+        STEP    = "[ETAPA]"
+    }
+
+    if ($Nivel -eq "DEBUG" -and $Script:Config.LogLevel -ne "DEBUG") { return }
+
+    $linha = "{0}  {1}  {2}" -f (Get-Date -Format "HH:mm:ss"), $prefixos[$Nivel], $Mensagem
+    Write-Host $linha -ForegroundColor $cores[$Nivel]
+    $Script:LogBuffer.Add($linha)
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIÃO: VERIFICAÇÃO E INSTALAÇÃO DE DEPENDÊNCIAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Test-NmapDisponivel {
+    <#
+    .SYNOPSIS
+        Verifica se o Nmap está acessível no PATH. Retorna $true/$false.
+    #>
+    try {
+        $null = Get-Command nmap -ErrorAction Stop
+        $versao = (nmap --version 2>&1 | Select-Object -First 1)
+        Write-Log "Nmap encontrado: $versao" -Nivel SUCCESS
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Install-Nmap {
+    <#
+    .SYNOPSIS
+        Instala o Nmap via Winget de forma silenciosa e valida a instalação.
+    #>
+    Write-Log "Nmap não localizado. Tentando instalação via Winget..." -Nivel WARN
+
+    # Verifica se Winget está disponível
+    try {
+        $null = Get-Command winget -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Winget não está disponível neste sistema. Instale o Nmap manualmente: https://nmap.org/download.html" -Nivel ERROR
+        throw "Dependência ausente: Winget/Nmap."
+    }
+
+    try {
+        Write-Log "Executando: winget install Nmap.Nmap (aguarde)..." -Nivel STEP
+        $proc = Start-Process -FilePath "winget" `
+            -ArgumentList "install -e --id Nmap.Nmap --silent --accept-package-agreements --accept-source-agreements" `
+            -Wait -PassThru -NoNewWindow
+
+        if ($proc.ExitCode -notin @(0, -1978335189)) {
+            # -1978335189 = já instalado (APPINSTALLER_ERROR_ALREADY_INSTALLED)
+            throw "Winget retornou código de saída: $($proc.ExitCode)"
+        }
+
+        # Atualiza o PATH da sessão atual para incluir diretório do Nmap
+        $nmapDir = "C:\Program Files (x86)\Nmap"
+        if (Test-Path $nmapDir) {
+            $env:PATH += ";$nmapDir"
+            Write-Log "PATH atualizado com: $nmapDir" -Nivel DEBUG
+        }
+
+        # Valida instalação
+        if (-not (Test-NmapDisponivel)) {
+            throw "Nmap instalado, porém não detectado no PATH. Reinicie o terminal e execute novamente."
+        }
+
+        Write-Log "Nmap instalado e validado com sucesso." -Nivel SUCCESS
+    }
+    catch {
+        Write-Log "Falha na instalação do Nmap: $_" -Nivel ERROR
+        throw
+    }
+}
+
+function Assert-Dependencias {
+    <#
+    .SYNOPSIS
+        Ponto de entrada para verificação e instalação de todas as dependências.
+    #>
+    Write-Log "Verificando dependências do script..." -Nivel STEP
+
+    if (-not (Test-NmapDisponivel)) {
+        Install-Nmap
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIÃO: DESCOBERTA DE REDE
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Get-RedeLocal {
+    <#
+    .SYNOPSIS
+        Detecta automaticamente IP local, máscara, CIDR, gateway e notação de rede.
+    .OUTPUTS
+        [PSCustomObject] com propriedades: IP, Mascara, CIDR, Gateway, RedeNotacao, Interface
+    #>
+    Write-Log "Identificando configurações de rede locais..." -Nivel STEP
+
+    try {
+        # Seleciona a rota padrão (menor métrica) para determinar a interface principal
+        $rotaPadrao = Get-NetRoute -DestinationPrefix "0.0.0.0/0" |
+            Where-Object { $_.NextHop -ne "::" -and $_.NextHop -ne "0.0.0.0" } |
+            Sort-Object RouteMetric |
+            Select-Object -First 1
+
+        if (-not $rotaPadrao) {
+            throw "Nenhuma rota padrão (gateway) detectada. Verifique a conectividade de rede."
+        }
+
+        $gateway = $rotaPadrao.NextHop
+        $ifIndex  = $rotaPadrao.InterfaceIndex
+
+        # Obtém endereço IPv4 da interface selecionada
+        $ipCfg = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 |
+            Where-Object { $_.IPAddress -notmatch "^169\.254" } | # exclui APIPA
+            Select-Object -First 1
+
+        if (-not $ipCfg) {
+            throw "Não foi possível obter endereço IPv4 válido para a interface $ifIndex."
+        }
+
+        $ip       = $ipCfg.IPAddress
+        $cidr     = $ipCfg.PrefixLength
+        $mascara  = Convert-CIDRParaMascara -CIDR $cidr
+        $redeBase = Get-NetworkAddress -IP $ip -CIDR $cidr
+
+        $info = [PSCustomObject]@{
+            IP           = $ip
+            Mascara      = $mascara
+            CIDR         = $cidr
+            Gateway      = $gateway
+            RedeNotacao  = "$redeBase/$cidr"
+            Interface    = (Get-NetAdapter -InterfaceIndex $ifIndex -ErrorAction SilentlyContinue).Name
+        }
+
+        Write-Log "IP Local    : $ip" -Nivel INFO
+        Write-Log "Máscara     : $mascara (/$cidr)" -Nivel INFO
+        Write-Log "Gateway     : $gateway" -Nivel INFO
+        Write-Log "Rede Alvo   : $($info.RedeNotacao)" -Nivel INFO
+        Write-Log "Interface   : $($info.Interface)" -Nivel INFO
+
+        return $info
+    }
+    catch {
+        Write-Log "Erro ao descobrir rede local: $_" -Nivel ERROR
+        throw
+    }
+}
+
+function Convert-CIDRParaMascara {
+    <#
+    .SYNOPSIS
+        Converte prefixo CIDR (ex: 24) para notação decimal pontilhada (ex: 255.255.255.0).
+    #>
+    param([Parameter(Mandatory)][ValidateRange(0,32)][int]$CIDR)
+
+    $binario = ("1" * $CIDR).PadRight(32, "0")
+    return (0..3 | ForEach-Object {
+        [Convert]::ToInt32($binario.Substring($_ * 8, 8), 2)
+    }) -join "."
+}
+
+function Get-NetworkAddress {
+    <#
+    .SYNOPSIS
+        Calcula o endereço de rede a partir do IP e CIDR.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [Parameter(Mandatory)][int]$CIDR
+    )
+
+    $ipBytes      = ([System.Net.IPAddress]::Parse($IP)).GetAddressBytes()
+    $maskBytes    = ([System.Net.IPAddress]::Parse((Convert-CIDRParaMascara -CIDR $CIDR))).GetAddressBytes()
+    $networkBytes = for ($i = 0; $i -lt 4; $i++) { $ipBytes[$i] -band $maskBytes[$i] }
+    return $networkBytes -join "."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIÃO: DETECÇÃO DE REDES ADICIONAIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Get-RedesAdicionais {
+    <#
+    .SYNOPSIS
+        Lista interfaces e rotas além da rede principal para detectar segmentação.
+    #>
+    param([Parameter(Mandatory)][string]$RedeAtual)
+
+    Write-Log "Verificando interfaces e rotas adicionais..." -Nivel STEP
+
+    try {
+        # Todos os IPs IPv4 ativos (exclui loopback e APIPA)
+        $todosIPs = Get-NetIPAddress -AddressFamily IPv4 |
+            Where-Object {
+                $_.IPAddress -notmatch "^127\." -and
+                $_.IPAddress -notmatch "^169\.254" -and
+                $_.PrefixOrigin -ne "WellKnown"
+            }
+
+        Write-Log "Interfaces IPv4 ativas detectadas:" -Nivel INFO
+        foreach ($addr in $todosIPs) {
+            $adapter = (Get-NetAdapter -InterfaceIndex $addr.InterfaceIndex -ErrorAction SilentlyContinue).Name
+            Write-Log "  · $($addr.IPAddress)/$($addr.PrefixLength)  [$adapter]" -Nivel INFO
+        }
+
+        # Rotas estáticas/específicas (exclui loopback, multicast e broadcast)
+        $rotas = Get-NetRoute -AddressFamily IPv4 |
+            Where-Object {
+                $_.DestinationPrefix -notmatch "^(127\.|224\.|255\.|0\.0\.0\.0/0)" -and
+                $_.NextHop -ne "0.0.0.0"
+            } |
+            Sort-Object DestinationPrefix -Unique
+
+        if ($rotas.Count -gt 0) {
+            Write-Log "Rotas adicionais na tabela de roteamento:" -Nivel WARN
+            foreach ($rota in $rotas) {
+                Write-Log "  · Destino: $($rota.DestinationPrefix)  Via: $($rota.NextHop)" -Nivel WARN
+            }
+            Write-Log "ATENÇÃO: Múltiplas redes/segmentos detectados. Considere auditar cada sub-rede separadamente." -Nivel WARN
+        }
+        else {
+            Write-Log "Nenhuma rota adicional significativa detectada." -Nivel INFO
+        }
+    }
+    catch {
+        Write-Log "Erro ao verificar redes adicionais: $_" -Nivel WARN
+        # Não interrompe execução — é informativo
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIÃO: VARREDURA COM NMAP
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Invoke-VarreduraNmap {
+    <#
+    .SYNOPSIS
+        Executa varredura Nmap com parâmetros controlados e retorna saída bruta.
+    .PARAMETER RedeAlvo
+        Notação CIDR da rede a varrer (ex: 192.168.1.0/24).
+    #>
+    param([Parameter(Mandatory)][string]$RedeAlvo)
+
+    Write-Log "Iniciando varredura Nmap em: $RedeAlvo" -Nivel STEP
+    Write-Log "Portas alvo: $($Script:Config.Portas)" -Nivel INFO
+
+    # Parâmetros Nmap explicados:
+    # -sS  : TCP SYN scan (stealth, não completa handshake — requer privilégio admin)
+    # -sV  : Detecção de versão de serviço
+    # -p   : Portas específicas (sem varrer tudo)
+    # --open: Exibe apenas portas abertas
+    # --script banner : Captura banners para identificação heurística
+    # --host-timeout   : Abandona host sem resposta após N segundos
+    # --min-rate/--max-rate : Controla taxa de pacotes (evita sobrecarga em redes corp.)
+    # -T4  : Timing agressivo mas controlado (T5 causa falsos negativos em LANs lentas)
+    # -oX -: Saída XML no stdout para parsing estruturado
+    # -n   : Sem resolução DNS reversa (mais rápido)
+
+    $argumentos = @(
+        "-sS", "-sV",
+        "-p", $Script:Config.Portas,
+        "--open",
+        "--script", "banner",
+        "--host-timeout", $Script:Config.NmapHostTimeout,
+        "--min-rate", $Script:Config.NmapMinRate,
+        "--max-rate", $Script:Config.NmapMaxRate,
+        "-T4", "-n",
+        "-oX", "-",   # XML para stdout → parsing mais confiável que texto
+        $RedeAlvo
+    )
+
+    Write-Log "Comando: nmap $($argumentos -join ' ')" -Nivel DEBUG
+
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($args)
+            & nmap @args 2>&1
+        } -ArgumentList (,$argumentos)
+
+        # Aguarda com timeout de segurança
+        $concluiu = Wait-Job -Job $job -Timeout $Script:Config.NmapTimeout
+
+        if (-not $concluiu) {
+            Stop-Job  -Job $job
+            Remove-Job -Job $job -Force
+            throw "Timeout atingido ($($Script:Config.NmapTimeout)s). A rede pode ser muito grande ou lenta."
+        }
+
+        $saida = Receive-Job -Job $job
+        Remove-Job -Job $job -Force
+
+        if (-not $saida) {
+            throw "Nmap não retornou nenhuma saída. Verifique permissões e conectividade."
+        }
+
+        Write-Log "Varredura concluída. Processando resultados..." -Nivel SUCCESS
+        return $saida -join "`n"
+    }
+    catch {
+        Write-Log "Erro durante varredura Nmap: $_" -Nivel ERROR
+        throw
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIÃO: PARSING E CLASSIFICAÇÃO
+# ─────────────────────────────────────────────────────────────────────────────
+
+function ConvertFrom-NmapXML {
+    <#
+    .SYNOPSIS
+        Converte saída XML do Nmap em objetos PowerShell estruturados.
+    #>
+    param([Parameter(Mandatory)][string]$XmlBruto)
+
+    $resultados = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    try {
+        # Isola apenas o bloco XML (Nmap pode emitir avisos antes do XML)
+        $xmlInicio = $XmlBruto.IndexOf("<?xml")
+        if ($xmlInicio -lt 0) {
+            throw "Saída XML não encontrada. Nmap pode não ter retornado resultados válidos."
+        }
+        $xmlPuro = $XmlBruto.Substring($xmlInicio)
+
+        [xml]$xml = $xmlPuro
+
+        foreach ($host in $xml.nmaprun.host) {
+            # Ignora hosts sem endereço ou sem portas abertas
+            $addrNode = $host.address | Where-Object { $_.addrtype -eq "ipv4" }
+            if (-not $addrNode) { continue }
+
+            $ip = $addrNode.addr
+
+            # Hostname (DNS reverso, se disponível)
+            $hostname = ($host.hostnames.hostname | Where-Object { $_.type -eq "PTR" } | Select-Object -First 1)?.name
+            if (-not $hostname) { $hostname = "" }
+
+            # Coleta portas abertas
+            $portasAbertas = $host.ports.port |
+                Where-Object { $_.state.state -eq "open" }
+
+            if (-not $portasAbertas) { continue }
+
+            # Lista de portas e serviços
+            $portasList   = [System.Collections.Generic.List[string]]::new()
+            $servicosList = [System.Collections.Generic.List[string]]::new()
+            $bannersList  = [System.Collections.Generic.List[string]]::new()
+
+            foreach ($porta in $portasAbertas) {
+                $numPorta  = $porta.portid
+                $protocolo = $porta.protocol
+                $svcName   = $porta.service?.name ?? "desconhecido"
+                $svcProd   = $porta.service?.product ?? ""
+                $svcVer    = $porta.service?.version ?? ""
+                $svcInfo   = ($svcName, $svcProd, $svcVer | Where-Object { $_ }) -join " "
+
+                # Banner via script NSE
+                $banner = ($porta.script | Where-Object { $_.id -eq "banner" })?.output ?? ""
+
+                $portasList.Add("$numPorta/$protocolo")
+                $servicosList.Add($svcInfo.Trim())
+                if ($banner) { $bannersList.Add("[$numPorta] $banner") }
+            }
+
+            $resultados.Add([PSCustomObject]@{
+                IP            = $ip
+                Hostname      = $hostname
+                Portas        = $portasList -join " | "
+                Servicos      = $servicosList -join " | "
+                Banners       = $bannersList -join " | "
+                PortasLista   = $portasList   # mantido para classificação (não vai pro CSV direto)
+                ServicosLista = $servicosList
+            })
+        }
+
+        Write-Log "$($resultados.Count) host(s) com portas abertas encontrado(s)." -Nivel INFO
+        return $resultados
+    }
+    catch {
+        Write-Log "Erro ao processar XML do Nmap: $_" -Nivel ERROR
+        throw
+    }
+}
+
+function Get-ClassificacaoDispositivo {
+    <#
+    .SYNOPSIS
+        Classifica um dispositivo como DVR/NVR, Câmera IP ou Outro com base em
+        portas abertas, serviços e banners detectados.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Portas,
+        [Parameter(Mandatory)][string[]]$Servicos,
+        [string]$Banners = ""
+    )
+
+    # Normaliza para comparação case-insensitive
+    $portasNums  = $Portas  | ForEach-Object { ($_ -split "/")[0] }
+    $svcsLower   = ($Servicos -join " ").ToLower()
+    $bannerLower = $Banners.ToLower()
+    $contextLower= "$svcsLower $bannerLower"
+
+    # ── Palavras-chave de banner/serviço que indicam fabricantes CFTV ──────────
+    $keywordsDVRNVR = @(
+        "dahua","dvr","nvr","hvr","xvr",
+        "hikvision","hik-connect",
+        "uniview","uniview nvr",
+        "hanwha","samsung wisenet",
+        "bosch divar",
+        "milestone","genetec",
+        "cp plus","cpplus"
+    )
+    $keywordsCamera = @(
+        "axis","rtsp","ipcam","ipcamera",
+        "vivotek","pelco","flir","mobotix",
+        "reolink","amcrest","foscam",
+        "onvif","network camera","ip camera","webcam"
+    )
+    $keywordsRoteador = @(
+        "cisco","mikrotik","ubiquiti","unifi",
+        "tp-link","d-link","asus router",
+        "ssh-","openssh","cisco ios","routeros"
+    )
+
+    $temRTSP       = "554"  -in $portasNums
+    $temHTTP       = "80"   -in $portasNums -or "8080" -in $portasNums -or "81" -in $portasNums
+    $temHTTPS      = "443"  -in $portasNums -or "8443" -in $portasNums
+    $temDahua      = "37777" -in $portasNums -or "37778" -in $portasNums
+    $temHikvision  = "8000" -in $portasNums
+    $temSDKGenerico= "34567" -in $portasNums -or "5000" -in $portasNums
+    $temTelnet     = "23"   -in $portasNums
+    $temSSH        = "22"   -in $portasNums
+    $temFTP        = "21"   -in $portasNums
+    $qtdPortas     = $portasNums.Count
+
+    # ── Regras de classificação (ordem de prioridade) ─────────────────────────
+
+    # 1. DVR/NVR: portas proprietárias Dahua ou Hikvision SDK
+    if ($temDahua -and ($temRTSP -or $temHTTP)) {
+        return "DVR/NVR - Dahua (porta 37777)"
+    }
+    if ($temHikvision -and ($temRTSP -or $temHTTP)) {
+        return "DVR/NVR - Hikvision (porta 8000)"
+    }
+    if ($temSDKGenerico -and $temRTSP -and $qtdPortas -ge 3) {
+        return "DVR/NVR - SDK Genérico (34567/5000)"
+    }
+
+    # 2. DVR/NVR por keywords de banner/serviço
+    foreach ($kw in $keywordsDVRNVR) {
+        if ($contextLower -match [regex]::Escape($kw)) {
+            return "DVR/NVR - Identificado por banner ($kw)"
+        }
+    }
+
+    # 3. Câmera IP: RTSP + HTTP/HTTPS (padrão típico de câmeras modernas)
+    if ($temRTSP -and ($temHTTP -or $temHTTPS)) {
+        return "Câmera IP (RTSP + HTTP)"
+    }
+
+    # 4. Câmera IP apenas por RTSP
+    if ($temRTSP) {
+        return "Câmera IP (RTSP)"
+    }
+
+    # 5. Câmera IP por keywords
+    foreach ($kw in $keywordsCamera) {
+        if ($contextLower -match [regex]::Escape($kw)) {
+            return "Câmera IP - Identificada por banner ($kw)"
+        }
+    }
+
+    # 6. Roteador/Switch por keywords
+    foreach ($kw in $keywordsRoteador) {
+        if ($contextLower -match [regex]::Escape($kw)) {
+            return "Equipamento de Rede (Roteador/Switch)"
+        }
+    }
+
+    # 7. Dispositivo com SSH/Telnet/FTP (administração remota)
+    if ($temSSH -or $temTelnet -or $temFTP) {
+        $adminPorts = @()
+        if ($temSSH)    { $adminPorts += "SSH" }
+        if ($temTelnet) { $adminPorts += "Telnet" }
+        if ($temFTP)    { $adminPorts += "FTP" }
+
+        if ($temTelnet) {
+            return "ATENÇÃO: Telnet aberto ($($adminPorts -join '+')) - Risco de Segurança"
+        }
+        return "Dispositivo c/ Acesso Remoto ($($adminPorts -join '+'))"
+    }
+
+    # 8. Somente HTTP/HTTPS → interface web genérica
+    if ($temHTTP -or $temHTTPS) {
+        return "Interface Web (HTTP/HTTPS)"
+    }
+
+    return "Outro Dispositivo de Rede"
+}
+
+function Build-Relatorio {
+    <#
+    .SYNOPSIS
+        Processa hosts do Nmap, classifica e monta o relatório final.
+    #>
+    param(
+        [Parameter(Mandatory)][object[]]$Hosts,
+        [Parameter(Mandatory)][string]$Gateway,
+        [Parameter(Mandatory)][string]$RedeAlvo
+    )
+
+    Write-Log "Classificando dispositivos detectados..." -Nivel STEP
+
+    foreach ($h in $Hosts) {
+        $classificacao = Get-ClassificacaoDispositivo `
+            -Portas   $h.PortasLista `
+            -Servicos $h.ServicosLista `
+            -Banners  $h.Banners
+
+        # Alerta visual para dispositivos CFTV e riscos de segurança
+        $nivel = "INFO"
+        if ($classificacao -match "DVR|NVR|Câmera") { $nivel = "SUCCESS" }
+        if ($classificacao -match "ATENÇÃO|Telnet")  { $nivel = "WARN"    }
+
+        Write-Log "  $($h.IP.PadRight(16)) → $classificacao" -Nivel $nivel
+
+        $Script:Relatorio.Add([PSCustomObject]@{
+            IP                 = $h.IP
+            Hostname           = $h.Hostname
+            Portas_Abertas     = $h.Portas
+            Servicos_Detectados= $h.Servicos
+            Banner             = $h.Banners
+            Classificacao      = $classificacao
+            Rede_Auditada      = $RedeAlvo
+            Gateway            = $Gateway
+            Data_Varredura     = (Get-Date -Format "dd/MM/yyyy HH:mm:ss")
+        })
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIÃO: EXPORTAÇÃO DE RELATÓRIOS
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Export-Relatorio {
+    <#
+    .SYNOPSIS
+        Exporta o relatório para CSV (Desktop) e log de texto.
+    #>
+    $baseName = "Auditoria_CFTV_$($Script:Config.Timestamp)"
+    $csvPath  = Join-Path $Script:Config.DesktopPath "$baseName.csv"
+    $logPath  = Join-Path $Script:Config.DesktopPath "$baseName.log"
+
+    Write-Log "Exportando relatório para: $csvPath" -Nivel STEP
+
+    try {
+        if ($Script:Relatorio.Count -eq 0) {
+            Write-Log "Nenhum dispositivo com portas abertas foi encontrado. Relatório vazio." -Nivel WARN
+
+            # Gera CSV vazio com cabeçalho para consistência
+            [PSCustomObject]@{
+                IP = ""; Hostname = ""; Portas_Abertas = ""; Servicos_Detectados = ""
+                Banner = ""; Classificacao = "SEM_RESULTADOS"
+                Rede_Auditada = ""; Gateway = ""; Data_Varredura = ""
+            } | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+        }
+        else {
+            $Script:Relatorio | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+        }
+
+        # Log de auditoria completo (console + arquivo)
+        $Script:LogBuffer | Out-File -FilePath $logPath -Encoding UTF8
+
+        Write-Log "CSV salvo  : $csvPath" -Nivel SUCCESS
+        Write-Log "Log salvo  : $logPath" -Nivel SUCCESS
+
+        # Resumo executivo no console
+        Write-Host ""
+        Write-Host "══════════════════════════════════════════════════════" -ForegroundColor Cyan
+        Write-Host "  RESUMO DA AUDITORIA CFTV" -ForegroundColor Cyan
+        Write-Host "══════════════════════════════════════════════════════" -ForegroundColor Cyan
+
+        $grupos = $Script:Relatorio | Group-Object { ($_.Classificacao -split " - ")[0] } | Sort-Object Count -Descending
+        foreach ($g in $grupos) {
+            Write-Host ("  {0,-40} {1,3} dispositivo(s)" -f $g.Name, $g.Count) -ForegroundColor White
+        }
+
+        Write-Host ("  {0,-40} {1,3} total" -f "TOTAL DE DISPOSITIVOS:", $Script:Relatorio.Count) -ForegroundColor Yellow
+        Write-Host "══════════════════════════════════════════════════════" -ForegroundColor Cyan
+        Write-Host ""
+    }
+    catch {
+        Write-Log "Erro ao exportar relatório: $_" -Nivel ERROR
+        throw
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIÃO: PONTO DE ENTRADA PRINCIPAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Invoke-AuditoriaCFTV {
+    <#
+    .SYNOPSIS
+        Orquestra todas as etapas da auditoria de rede CFTV.
+    #>
+
+    Write-Host ""
+    Write-Host "══════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "  AUDITORIA DE REDE CFTV PROFISSIONAL v2.0" -ForegroundColor Cyan
+    Write-Host "  $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')" -ForegroundColor Gray
+    Write-Host "══════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host ""
+
+    # ETAPA 1 — Dependências
+    try {
+        Assert-Dependencias
+    }
+    catch {
+        Write-Log "Abortando: dependência crítica não satisfeita. $_" -Nivel ERROR
+        exit 1
+    }
+
+    # ETAPA 2 — Descoberta de rede
+    try {
+        $rede = Get-RedeLocal
+    }
+    catch {
+        Write-Log "Abortando: não foi possível identificar a rede local. $_" -Nivel ERROR
+        exit 1
+    }
+
+    # ETAPA 3 — Redes adicionais (informativo)
+    Get-RedesAdicionais -RedeAtual $rede.RedeNotacao
+
+    # ETAPA 4 — Varredura Nmap
+    try {
+        $xmlSaida = Invoke-VarreduraNmap -RedeAlvo $rede.RedeNotacao
+    }
+    catch {
+        Write-Log "Abortando: falha na varredura de rede. $_" -Nivel ERROR
+        exit 1
+    }
+
+    # ETAPA 5 — Parsing do XML
+    try {
+        $hosts = ConvertFrom-NmapXML -XmlBruto $xmlSaida
+    }
+    catch {
+        Write-Log "Abortando: não foi possível processar os resultados do Nmap. $_" -Nivel ERROR
+        exit 1
+    }
+
+    # ETAPA 6 — Classificação e relatório
+    if ($hosts.Count -gt 0) {
+        Build-Relatorio -Hosts $hosts -Gateway $rede.Gateway -RedeAlvo $rede.RedeNotacao
+    }
+    else {
+        Write-Log "Nenhum host respondeu na varredura. Verifique firewall e conectividade." -Nivel WARN
+    }
+
+    # ETAPA 7 — Exportação
+    try {
+        Export-Relatorio
+    }
+    catch {
+        Write-Log "Aviso: erro ao exportar. Verifique permissões no Desktop. $_" -Nivel WARN
+    }
+
+    Write-Log "Auditoria finalizada." -Nivel SUCCESS
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXECUÇÃO
+# ─────────────────────────────────────────────────────────────────────────────
+Invoke-AuditoriaCFTV
