@@ -23,7 +23,7 @@ Script PowerShell 5.1+ para auditoria de rede CFTV em Windows 10/11.
 Executar diretamente do GitHub:
 
 ```powershell
-irm https://raw.githubusercontent.com/USUARIO/REPOSITORIO/main/Auditoria_CFTV_Pro.ps1 | iex
+irm https://raw.githubusercontent.com/wadytech/varer/CFTV.ps1 | iex
 ```
 
 Executar com parâmetros:
